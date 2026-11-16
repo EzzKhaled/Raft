@@ -182,15 +182,26 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 // term. the third return value is true if this server believes it is
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := false
+    index := -1
+    term := -1
+    isLeader := false
+    // Your code here (3B). 
+    rf.mu.Lock()
+    defer rf.mu.Unlock()
 
-	// Your code here (3B).
+    if rf.state != 2 {
+        return index, term, isLeader // returns -1, -1, false
+    }
 
+    // Node is the leader
+    isLeader = true
+    term = rf.currentTerm
+    index = len(rf.log)
+    
+    // Append the new command to the leader's local log
+    rf.log = append(rf.log, LogEntry{Command: command, Term: term})
 	return index, term, isLeader
 }
-
 // the tester calls Kill() when a Raft instance won't
 // be needed again. you are not required to do anything
 // in Kill(), but it might be convenient to (for example)
