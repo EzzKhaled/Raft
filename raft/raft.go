@@ -18,7 +18,9 @@ package raft
 //
 
 import (
+	"math/rand"
 	"sync"
+	"time"
 
 	"lab2raft/labrpc"
 )
@@ -47,7 +49,12 @@ type Raft struct {
 	// Your data here (3A, 3B).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-
+	dead        bool      // set by Kill(); stops background goroutines
+	state       int       // 0 = follower, 1 = candidate, 2 = leader
+	deadline    time.Time // election deadline
+	currentTerm int
+	votedFor    int        // -1 = none
+	log         []LogEntry // log[0] is a dummy entry; real entries start at index 1
 }
 
 // return currentTerm and whether this server
@@ -57,6 +64,10 @@ func (rf *Raft) GetState() (int, bool) {
 	var term int
 	var isleader bool
 	// Your code here (3A).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	term = rf.currentTerm
+	isleader = rf.state == 2
 	return term, isleader
 }
 
@@ -64,17 +75,50 @@ func (rf *Raft) GetState() (int, bool) {
 // field names must start with capital letters!
 type RequestVoteArgs struct {
 	// Your data here (3A, 3B).
+	Term         int
+	CandidateId  int
+	LastLogIndex int
+	LastLogTerm  int
 }
 
 // example RequestVote RPC reply structure.
 // field names must start with capital letters!
 type RequestVoteReply struct {
 	// Your data here (3A).
+	Term        int
+	VoteGranted bool
 }
 
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (3A, 3B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	reply.VoteGranted = false
+	if args.Term < rf.currentTerm {
+		reply.Term = rf.currentTerm
+		return
+	}
+	if args.Term > rf.currentTerm {
+		// newer term: step down
+		rf.currentTerm = args.Term
+		rf.state = 0
+		rf.votedFor = -1
+	}
+	reply.Term = rf.currentTerm
+
+	// election restriction: candidate's log must be at least as up-to-date
+	lastIndex := len(rf.log) - 1
+	lastTerm := rf.log[lastIndex].Term
+	upToDate := args.LastLogTerm > lastTerm ||
+		(args.LastLogTerm == lastTerm && args.LastLogIndex >= lastIndex)
+
+	if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) && upToDate {
+		rf.votedFor = args.CandidateId
+		reply.VoteGranted = true
+		rf.deadline = time.Now().Add(time.Duration(400+rand.Intn(300)) * time.Millisecond)
+	}
 }
 
 type AppendEntriesArgs struct {
@@ -168,6 +212,77 @@ func Make(peers []*labrpc.ClientEnd, me int, applyCh chan ApplyMsg) *Raft {
 	rf.me = me
 
 	// Your initialization code here (3A, 3B).
+	rf.state = 0
+	rf.currentTerm = 0
+	rf.votedFor = -1
+	rf.log = []LogEntry{{Term: 0}} // dummy entry at index 0
+	rf.deadline = time.Now().Add(time.Duration(400+rand.Intn(300)) * time.Millisecond)
 
+	// election timer: start an election when the deadline passes
+	// without hearing from a leader
+	go func() {
+		for {
+			time.Sleep(10 * time.Millisecond)
+			rf.mu.Lock()
+			if rf.dead {
+				rf.mu.Unlock()
+				return
+			}
+			if rf.state == 2 || !time.Now().After(rf.deadline) {
+				rf.mu.Unlock()
+				continue
+			}
+
+			// become candidate
+			rf.state = 1
+			rf.currentTerm++
+			rf.votedFor = rf.me
+			rf.deadline = time.Now().Add(time.Duration(400+rand.Intn(300)) * time.Millisecond)
+			term := rf.currentTerm
+			args := &RequestVoteArgs{
+				Term:         term,
+				CandidateId:  rf.me,
+				LastLogIndex: len(rf.log) - 1,
+				LastLogTerm:  rf.log[len(rf.log)-1].Term,
+			}
+			votes := 1
+
+			if votes > len(rf.peers)/2 { // single-server cluster
+				rf.state = 2
+			}
+
+			for i := range rf.peers {
+				if i == rf.me {
+					continue
+				}
+				go func(server int) {
+					reply := &RequestVoteReply{}
+					if !rf.sendRequestVote(server, args, reply) {
+						return
+					}
+					rf.mu.Lock()
+					defer rf.mu.Unlock()
+					if rf.currentTerm != term || rf.state != 1 {
+						return // stale reply
+					}
+					if reply.Term > rf.currentTerm {
+						// newer term: step down
+						rf.currentTerm = reply.Term
+						rf.state = 0
+						rf.votedFor = -1
+						return
+					}
+					if reply.VoteGranted {
+						votes++
+						if votes > len(rf.peers)/2 {
+							// become leader
+							rf.state = 2
+						}
+					}
+				}(i)
+			}
+			rf.mu.Unlock()
+		}
+	}()
 	return rf
 }
